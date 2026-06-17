@@ -110,7 +110,8 @@
 
   .call-btn.loading {
     background: #1a1a3a;
-    cursor: default;
+    cursor: not-allowed;
+    opacity: 0.7;
   }
 
   .call-btn svg {
@@ -222,14 +223,63 @@
 
 <script>
 const AGENT_ID = 'agent_0201kstm144xe6n94rb4knrew7z7';
-
-
-// n8n webhook для получения данных календаря и почты
 const N8N_BRIEFING_WEBHOOK = 'https://primary-production-f690.up.railway.app/webhook/briefing';
 
 let conversation = null;
 let isMuted = false;
 let isActive = false;
+let isLoading = false; // ← ФИК 1: флаг блокировки двойного нажатия
+
+// ФИК 2: Wake Lock — не даём телефону засыпать во время звонка
+let wakeLock = null;
+
+async function requestWakeLock() {
+  // Сначала пробуем нативный WakeLock API (поддерживается iOS 16.4+, Chrome, Firefox)
+  if ('wakeLock' in navigator) {
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => {
+        // Если система освободила лок (например, при сворачивании) — пробуем снова
+        if (isActive) requestWakeLock();
+      });
+      console.log('[WakeLock] Активен');
+      return;
+    } catch(e) {
+      console.warn('[WakeLock] WakeLock API недоступен:', e.message);
+    }
+  }
+  // Fallback: NoSleep через скрытое видео (работает на старых iOS)
+  try {
+    const video = document.createElement('video');
+    video.setAttribute('playsinline', '');
+    video.setAttribute('muted', '');
+    video.setAttribute('loop', '');
+    // Минимальный mp4 в base64 (1x1 пиксель, <1KB)
+    video.src = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAu1tZGF0AAACrAYF//+p3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE0MiByMjQ3OSBkZDc5YTYxIC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAxNCAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTMgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MzoweDExMyBtZT1oZXggc3VibWU9NyBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0xIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MSA4eDhkY3Q9MSBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiBsb29rYWhlYWRfZnJhbWVzPTUwIGJ3ZWlnaHQ9MCBvcGVuX2dvcD0wIHdlaWdodHA9MiBreWZyYW1lPTI1MCBrZXlpbnQ9MjUgdmJ2X21heHJhdGU9MTI4IHZidl9idWZzaXplPTEyOCBmaWxsPTEgYWNfcmF0ZT0yNTY6MTI4OjE1OAAABF5saWJmYWFjIDEuMjgAAAAMZnJlZQAAAu1tZGF0';
+    video.style.cssText = 'position:fixed;opacity:0;width:1px;height:1px;pointer-events:none';
+    document.body.appendChild(video);
+    await video.play();
+    wakeLock = { _video: video, release: () => { video.pause(); video.remove(); } };
+    console.log('[WakeLock] Fallback видео активно');
+  } catch(e) {
+    console.warn('[WakeLock] Fallback тоже не сработал:', e.message);
+  }
+}
+
+async function releaseWakeLock() {
+  if (wakeLock) {
+    try { await wakeLock.release(); } catch(e) {}
+    wakeLock = null;
+    console.log('[WakeLock] Освобождён');
+  }
+}
+
+// Восстанавливаем WakeLock если приложение вернулось из фона
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && isActive && !wakeLock) {
+    requestWakeLock();
+  }
+});
 
 const statusEl = document.getElementById('status');
 const avatarEl = document.getElementById('avatar');
@@ -250,21 +300,25 @@ function setAvatarMode(mode) {
 }
 
 async function fetchBriefingOnce() {
-  const res = await fetch(N8N_BRIEFING_WEBHOOK, { method: 'POST' });
+  const res = await fetch(N8N_BRIEFING_WEBHOOK, {
+    method: 'POST',
+    headers: {
+      'ngrok-skip-browser-warning': 'true', // на случай если Railway когда-то заменится ngrok
+      'Content-Type': 'application/json'
+    },
+    body: '{}'
+  });
   const text = await res.text();
   if (!text || !text.trim()) throw new Error('empty response');
   return JSON.parse(text);
 }
 
 async function getBriefing() {
-  if (!N8N_BRIEFING_WEBHOOK) {
-    console.warn('[Briefing] N8N_BRIEFING_WEBHOOK не задан, пропускаю.');
-    return null;
-  }
+  if (!N8N_BRIEFING_WEBHOOK) return null;
   console.log('[Briefing] Запрашиваю:', N8N_BRIEFING_WEBHOOK);
   try {
     const data = await fetchBriefingOnce();
-    console.log('[Briefing] Ответ от webhook:', data);
+    console.log('[Briefing] Ответ:', data);
     return data || null;
   } catch(e) {
     console.warn('[Briefing] Первая попытка неудачна:', e.message, '— повтор через 2с');
@@ -274,13 +328,16 @@ async function getBriefing() {
       console.log('[Briefing] Ответ (повтор):', data);
       return data || null;
     } catch(e2) {
-      console.error('[Briefing] Ошибка fetch (обе попытки):', e2);
+      console.error('[Briefing] Ошибка (обе попытки):', e2);
       return null;
     }
   }
 }
 
 async function toggleCall() {
+  // ФИК 1: блокируем повторные нажатия пока идёт загрузка
+  if (isLoading) return;
+
   if (isActive) {
     await endCall();
   } else {
@@ -289,6 +346,8 @@ async function toggleCall() {
 }
 
 async function startCall() {
+  // ФИК 1: ставим флаг и делаем кнопку некликабельной
+  isLoading = true;
   callBtn.className = 'call-btn loading';
   setStatus('Подготовка...', 'active');
 
@@ -297,12 +356,12 @@ async function startCall() {
   } catch(e) {
     setStatus('Нет доступа к микрофону', 'error');
     callBtn.className = 'call-btn idle';
+    isLoading = false;
     return;
   }
 
   setStatus('Загружаю данные...', 'active');
   const briefingData = await getBriefing();
-  console.log('[startCall] briefingData после await:', briefingData);
 
   if (briefingData) {
     briefingTextEl.textContent = briefingData.calendar_briefing || '';
@@ -312,20 +371,20 @@ async function startCall() {
   setStatus('Соединяю...', 'active');
 
   try {
-    // UMD регистрируется как window.client (см. lib.umd.js)
     const Conversation = window.client?.Conversation;
     if (!Conversation) {
-      console.error('[SDK] window.client:', window.client);
       setStatus('SDK не загружен — обновите страницу', 'error');
       callBtn.className = 'call-btn idle';
+      isLoading = false;
       return;
     }
 
     const sessionConfig = {
       agentId: AGENT_ID,
       connectionType: 'webrtc',
-      onConnect: () => {
+      onConnect: async () => {
         isActive = true;
+        isLoading = false; // ← разблокируем только после реального соединения
         setStatus('Соединено', 'active');
         setAvatarMode('');
         callBtn.className = 'call-btn active';
@@ -333,12 +392,15 @@ async function startCall() {
         btnIcon.setAttribute('stroke', '#c06060');
         btnIcon.setAttribute('d', 'M18 6L6 18M6 6l12 12');
         waveEl.classList.add('active');
+        await requestWakeLock(); // ФИК 2: включаем wake lock при соединении
       },
       onDisconnect: () => {
+        releaseWakeLock(); // ФИК 2: освобождаем при отключении
         resetUI();
       },
       onError: (err) => {
         setStatus('Ошибка соединения', 'error');
+        releaseWakeLock();
         resetUI();
       },
       onModeChange: ({ mode }) => {
@@ -361,7 +423,6 @@ async function startCall() {
         call_mode: briefingData.call_mode || 'personal'
       };
     }
-    console.log('[startCall] dynamicVariables для ElevenLabs:', sessionConfig.dynamicVariables);
 
     conversation = await Conversation.startSession(sessionConfig);
 
@@ -369,6 +430,8 @@ async function startCall() {
     console.error(e);
     setStatus('Ошибка: ' + (e.message || 'попробуйте ещё раз'), 'error');
     callBtn.className = 'call-btn idle';
+    isLoading = false;
+    releaseWakeLock();
   }
 }
 
@@ -377,11 +440,13 @@ async function endCall() {
     try { await conversation.endSession(); } catch(e) {}
     conversation = null;
   }
+  await releaseWakeLock();
   resetUI();
 }
 
 function resetUI() {
   isActive = false;
+  isLoading = false;
   isMuted = false;
   callBtn.className = 'call-btn idle';
   muteBtn.classList.remove('visible');
