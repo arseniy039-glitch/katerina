@@ -230,6 +230,33 @@ let isMuted = false;
 let isActive = false;
 let isLoading = false; // ← ФИК 1: флаг блокировки двойного нажатия
 
+// ФИК 3: iOS аудио keepalive — тихий звук чтобы iOS не засыпал аудио сессию
+let audioContext = null;
+let keepAliveNode = null;
+
+function startAudioKeepalive() {
+  try {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    gainNode.gain.value = 0.001; // практически тишина
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    oscillator.start();
+    keepAliveNode = oscillator;
+    console.log('[AudioKeepalive] Активен');
+  } catch(e) {
+    console.warn('[AudioKeepalive] Ошибка:', e.message);
+  }
+}
+
+function stopAudioKeepalive() {
+  try {
+    if (keepAliveNode) { keepAliveNode.stop(); keepAliveNode = null; }
+    if (audioContext) { audioContext.close(); audioContext = null; }
+    console.log('[AudioKeepalive] Остановлен');
+  } catch(e) {}
+}
 // ФИК 2: Wake Lock — не даём телефону засыпать во время звонка
 let wakeLock = null;
 
@@ -393,9 +420,11 @@ async function startCall() {
         btnIcon.setAttribute('d', 'M18 6L6 18M6 6l12 12');
         waveEl.classList.add('active');
         await requestWakeLock(); // ФИК 2: включаем wake lock при соединении
+        startAudioKeepalive(); // ФИК 3: iOS аудио keepalive
       },
       onDisconnect: () => {
         releaseWakeLock(); // ФИК 2: освобождаем при отключении
+        stopAudioKeepalive(); // ФИК 3: останавливаем keepalive
         resetUI();
       },
       onError: (err) => {
